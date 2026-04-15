@@ -240,7 +240,13 @@ def patch_model(
     is_active = create_timestep_scheduler(start, end)
     
     # Mutable state container for cross-block communication
-    ip_options = IPOptions(weight=weight)
+    # NOTE: This must stay as a dict reference shared with all wrappers.
+    # Using IPOptions.to_dict() creates a snapshot and breaks updates.
+    ip_options_dict: Dict[str, Any] = {
+        "hidden_states": None,
+        "t_emb": None,
+        "weight": weight,
+    }
     
     def ddit_wrapper(
         forward: Callable,
@@ -260,7 +266,9 @@ def patch_model(
         the entire call stack.
         """
         # Compute timestep percentage (1 - t/max gives progress through denoising)
-        t_percent = 1.0 - args["timestep"].flatten()[0].cpu().item()
+        raw_timestep = args["timestep"].flatten()[0].detach().float().cpu().item()
+        t_percent = 1.0 - (raw_timestep / float(timestep_schedule_max))
+        t_percent = max(0.0, min(1.0, t_percent))
         
         if is_active(t_percent):
             # Compute batch size accounting for classifier-free guidance
@@ -277,10 +285,11 @@ def patch_model(
             # Compute IP embeddings with timestep conditioning
             image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
             
-            ip_options.hidden_states = image_emb
-            ip_options.t_emb = t_emb
+            ip_options_dict["hidden_states"] = image_emb
+            ip_options_dict["t_emb"] = t_emb
         else:
-            ip_options.clear()
+            ip_options_dict["hidden_states"] = None
+            ip_options_dict["t_emb"] = None
         
         return forward(args["input"], args["timestep"], **args["c"])
     
@@ -289,8 +298,6 @@ def patch_model(
     # Patch attention blocks with IP wrappers
     # Strategy: Round-robin assignment of processors to blocks
     proc_idx = 0
-    ip_options_dict = ip_options.to_dict()  # For backward compatibility
-    
     for name, module in model.named_modules():
         # Identify attention blocks by their characteristic projections
         if hasattr(module, "to_q") and hasattr(module, "to_k"):
