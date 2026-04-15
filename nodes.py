@@ -273,10 +273,13 @@ def patch_model(
         if is_active(t_percent):
             # Compute batch size accounting for classifier-free guidance
             batch_size = args["input"].shape[0] // len(args["cond_or_uncond"])
+            cond_or_uncond = torch.as_tensor(
+                args["cond_or_uncond"], device=clip_embeds.device
+            )
             
             # Select embeddings based on CFG indices and expand to batch
             # cond_or_uncond: [0] for conditional, [1] for unconditional, [0, 1] for both
-            embeds = clip_embeds[args["cond_or_uncond"]]
+            embeds = clip_embeds[cond_or_uncond]
             embeds = torch.repeat_interleave(embeds, batch_size, dim=0)
             
             # Scale timestep to model's expected range
@@ -284,12 +287,35 @@ def patch_model(
             
             # Compute IP embeddings with timestep conditioning
             image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
+
+            # Prevent unconditional branch leakage:
+            # the resampler can produce non-zero outputs from zero embeds due to biases.
+            # If unconditional branch carries IP signal, CFG can cancel most of the effect,
+            # making the weight slider appear unresponsive.
+            uncond_mask = torch.repeat_interleave(cond_or_uncond == 1, batch_size, dim=0)
+            image_emb = image_emb.clone()
+            image_emb[uncond_mask] = 0.0
             
             ip_options_dict["hidden_states"] = image_emb
             ip_options_dict["t_emb"] = t_emb
+            if logger.isEnabledFor(logging.DEBUG):
+                ip_norm = image_emb.float().norm(dim=-1).mean().item()
+                logger.debug(
+                    "IPAdapter active: t_percent=%.4f weight=%.3f mean_ip_norm=%.6f",
+                    t_percent,
+                    ip_options_dict["weight"],
+                    ip_norm,
+                )
         else:
             ip_options_dict["hidden_states"] = None
             ip_options_dict["t_emb"] = None
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "IPAdapter inactive: t_percent=%.4f outside [%.3f, %.3f]",
+                    t_percent,
+                    start,
+                    end,
+                )
         
         return forward(args["input"], args["timestep"], **args["c"])
     
