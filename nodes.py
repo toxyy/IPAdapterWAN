@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from enum import Enum, auto
 import math
+import itertools
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,7 @@ folder_paths.folder_names_and_paths["ipadapter"] = (
 
 logger = logging.getLogger(__name__)
 NODE_APPLY_NAME = "Apply IPAdapter WAN Model"
+PATCH_SESSION_COUNTER = itertools.count(1)
 
 
 class VisionEncoderType(Enum):
@@ -242,6 +244,8 @@ def patch_model(
         start: Start percentage for timestep scheduling
         end: End percentage for timestep scheduling
     """
+    patch_session_id = next(PATCH_SESSION_COUNTER)
+
     def _module_stats(module: nn.Module) -> Dict[str, int]:
         jointblock_like = 0
         to_qk_like = 0
@@ -258,7 +262,7 @@ def patch_model(
             "to_qk_like": to_qk_like,
         }
 
-    def _resolve_best_module(module: Any) -> Any:
+    def _resolve_best_module(module: Any) -> Tuple[Any, List[Dict[str, Any]]]:
         """Resolve best patching target across wrapper chain (DisTorch2/Distributed/GGUF)."""
         chain: List[Tuple[str, nn.Module]] = []
         seen_ids = set()
@@ -279,13 +283,24 @@ def patch_model(
         # Prefer module level with the most JointBlock-like modules.
         best_idx = 0
         best_score: Tuple[int, int, int] = (-1, -1, -1)
-        for idx, (_, mod) in enumerate(chain):
+        chain_debug: List[Dict[str, Any]] = []
+        for idx, (name, mod) in enumerate(chain):
             stats = _module_stats(mod)
+            chain_debug.append(
+                {
+                    "idx": idx,
+                    "name": name,
+                    "id": id(mod),
+                    "total": stats["total"],
+                    "jointblock_like": stats["jointblock_like"],
+                    "to_qk_like": stats["to_qk_like"],
+                }
+            )
             score = (stats["jointblock_like"], stats["to_qk_like"], stats["total"])
             if score > best_score:
                 best_score = score
                 best_idx = idx
-        return chain[best_idx][1] if chain else module
+        return (chain[best_idx][1] if chain else module), chain_debug
 
     # Resolve diffusion model robustly across different loaders/wrappers.
     base_model = getattr(patcher, "model", None)
@@ -297,7 +312,7 @@ def patch_model(
             f"{NODE_APPLY_NAME}: could not resolve diffusion_model from patcher "
             f"(patcher_type={type(patcher).__name__}, base_model_type={type(base_model).__name__})."
         )
-    model = _resolve_best_module(diffusion_model)
+    model, unwrap_chain_debug = _resolve_best_module(diffusion_model)
 
     # Resolve timestep schedule robustly; some wrappers do not expose model_config directly.
     sampling_settings = getattr(getattr(base_model, "model_config", None), "sampling_settings", None)
@@ -322,8 +337,22 @@ def patch_model(
     
     def emit_debug(message: str) -> None:
         # Console visibility is important for ComfyUI users diagnosing workflows.
-        print(f"[{NODE_APPLY_NAME}] {message}")
-        logger.info("[%s] %s", NODE_APPLY_NAME, message)
+        print(f"[{NODE_APPLY_NAME}][session={patch_session_id}] {message}")
+        logger.info("[%s][session=%s] %s", NODE_APPLY_NAME, patch_session_id, message)
+
+    emit_debug(
+        "patch setup "
+        f"patcher_type={type(patcher).__name__} patcher_id={id(patcher)} "
+        f"base_model_type={type(base_model).__name__} base_model_id={id(base_model)} "
+        f"diffusion_model_type={type(diffusion_model).__name__} diffusion_model_id={id(diffusion_model)}"
+    )
+    for item in unwrap_chain_debug:
+        emit_debug(
+            "unwrap_chain "
+            f"idx={item['idx']} name={item['name']} id={item['id']} "
+            f"total={item['total']} jointblock_like={item['jointblock_like']} "
+            f"to_qk_like={item['to_qk_like']}"
+        )
 
     debug_state = {
         "last_active": None,
@@ -383,9 +412,16 @@ def patch_model(
             ip_options_dict["hidden_states"] = image_emb
             ip_options_dict["t_emb"] = t_emb
             ip_norm = image_emb.float().norm(dim=-1).mean().item()
+            ip_mean = image_emb.float().mean().item()
+            ip_std = image_emb.float().std().item()
+            uncond_ratio = uncond_mask.float().mean().item()
             # Emit on active-state entry and at coarse 5% progression buckets.
             progress_bucket = int(t_percent * 20)
-            if debug_state["last_active"] is not True or debug_state["last_bucket"] != progress_bucket:
+            if (
+                debug_state["last_active"] is not True
+                or debug_state["last_bucket"] != progress_bucket
+                or debug_state["step"] <= 3
+            ):
                 emit_debug(
                     (
                         "active"
@@ -394,6 +430,11 @@ def patch_model(
                         f" range=[{start:.3f},{end:.3f}]"
                         f" weight={ip_options_dict['weight']:.3f}"
                         f" mean_ip_norm={ip_norm:.6f}"
+                        f" mean={ip_mean:.6f}"
+                        f" std={ip_std:.6f}"
+                        f" uncond_ratio={uncond_ratio:.3f}"
+                        f" cond_or_uncond={list(map(int, cond_or_uncond.cpu().tolist()))}"
+                        f" input_shape={tuple(args['input'].shape)}"
                     )
                 )
             debug_state["last_active"] = True
@@ -431,6 +472,11 @@ def patch_model(
             )
             patcher.set_model_patch_replace(wrapper, name)
             proc_idx += 1
+            if proc_idx <= 60:
+                emit_debug(
+                    f"patched module idx={proc_idx} name='{name}' class='{type(module).__name__}' "
+                    f"module_id={id(module)} proc_idx={(proc_idx - 1) % len(ip_procs)}"
+                )
     
     logger.debug(f"Patched {proc_idx} attention blocks with IP adapters")
     model_stats = _module_stats(model) if isinstance(model, nn.Module) else {
