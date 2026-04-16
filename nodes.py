@@ -338,7 +338,6 @@ def patch_model(
     def emit_debug(message: str) -> None:
         # Console visibility is important for ComfyUI users diagnosing workflows.
         print(f"[{NODE_APPLY_NAME}][session={patch_session_id}] {message}")
-        logger.info("[%s][session=%s] %s", NODE_APPLY_NAME, patch_session_id, message)
 
     emit_debug(
         "patch setup "
@@ -499,8 +498,10 @@ def patch_model(
     if proc_idx == 0:
         # Extra diagnostics for incompatible wrappers/topologies.
         debug_lines: List[str] = []
+        class_counts: Dict[str, int] = {}
         for module_name, module_obj in model.named_modules():
             cls_name = type(module_obj).__name__
+            class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
             if "block" in module_name.lower() or "joint" in cls_name.lower():
                 attrs = []
                 for attr in ("context_block", "x_block", "to_q", "to_k", "attn", "attn2"):
@@ -512,6 +513,37 @@ def patch_model(
                     )
             if len(debug_lines) >= 50:
                 break
+        # Show the top module classes to identify architectural patterns.
+        top_classes = sorted(
+            class_counts.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:25]
+        emit_debug(f"top_module_classes={top_classes}")
+
+        # Broader attention-like scan (q/k naming variants used by different loaders/models).
+        attention_attr_pairs = [
+            ("to_q", "to_k"),
+            ("q_proj", "k_proj"),
+            ("query", "key"),
+            ("wq", "wk"),
+            ("q", "k"),
+        ]
+        attention_candidates: List[str] = []
+        for module_name, module_obj in model.named_modules():
+            matched = []
+            for q_attr, k_attr in attention_attr_pairs:
+                if hasattr(module_obj, q_attr) and hasattr(module_obj, k_attr):
+                    matched.append((q_attr, k_attr))
+            if matched:
+                attention_candidates.append(
+                    f"attention_candidate module='{module_name}' class='{type(module_obj).__name__}' matches={matched}"
+                )
+            if len(attention_candidates) >= 80:
+                break
+        for line in attention_candidates:
+            emit_debug(line)
+
         for line in debug_lines:
             emit_debug(line)
         emit_debug(
