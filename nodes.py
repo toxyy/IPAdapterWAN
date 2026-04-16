@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from enum import Enum, auto
 
@@ -54,6 +54,7 @@ NODE_APPLY_NAME = "Apply IPAdapter WAN Model"
 class VisionEncoderType(Enum):
     """Supported vision encoder architectures."""
     SIGLIP2_SO400M = auto()  # SigLIP2 patch16 so400m naflex (dynamic resolution, variable tokens)
+    CLIP_VIT_H = auto()  # OpenCLIP ViT-H/14 style fixed-token encoder
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,11 @@ class VisionEncoderConfig:
                 embedding_dim=1152,  # so400m variant
                 supports_dynamic_resolution=True,
                 max_sequence_length=None,  # naflex: variable
+            ),
+            VisionEncoderType.CLIP_VIT_H: cls(
+                embedding_dim=1024,  # OpenCLIP ViT-H hidden size
+                supports_dynamic_resolution=False,
+                max_sequence_length=257,
             ),
         }
         return configs[encoder_type]
@@ -120,10 +126,13 @@ class IPAdapterConfig:
     
     # Vision encoder (default to SigLIP2 for modern workflows)
     vision_encoder: VisionEncoderType = VisionEncoderType.SIGLIP2_SO400M
+    embedding_dim_override: Optional[int] = None
     
     @property
     def embedding_dim(self) -> int:
         """Get embedding dimension from vision encoder config."""
+        if self.embedding_dim_override is not None:
+            return self.embedding_dim_override
         return VisionEncoderConfig.from_encoder_type(self.vision_encoder).embedding_dim
 
 
@@ -412,7 +421,6 @@ class WANIPAdapter:
         """
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.dtype = dtype
-        self.config = config or IPAdapterConfig()
         
         # Load checkpoint
         checkpoint_path = os.path.join(MODELS_DIR, checkpoint)
@@ -423,6 +431,32 @@ class WANIPAdapter:
             map_location=self.device,
             weights_only=True,
         )
+
+        # Auto-infer architecture from checkpoint when explicit config isn't provided.
+        if config is None:
+            try:
+                self.config = self._infer_config_from_checkpoint(self.state_dict)
+                logger.info(
+                    "Inferred IPAdapter config from checkpoint: embedding_dim=%s, "
+                    "resampler_dim=%s, depth=%s, num_queries=%s, output_dim=%s, "
+                    "head_dim=%s, timesteps_emb_dim=%s",
+                    self.config.embedding_dim,
+                    self.config.resampler_dim,
+                    self.config.resampler_depth,
+                    self.config.num_queries,
+                    self.config.output_dim,
+                    self.config.head_dim,
+                    self.config.timesteps_emb_dim,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not infer checkpoint architecture automatically (%s). "
+                    "Falling back to default SigLIP2 config.",
+                    exc,
+                )
+                self.config = IPAdapterConfig(vision_encoder=VisionEncoderType.SIGLIP2_SO400M)
+        else:
+            self.config = config
         
         # Initialize and load resampler
         self.resampler = self._build_resampler()
@@ -450,6 +484,68 @@ class WANIPAdapter:
         logger.info(
             f"Loaded IPAdapter with {len(self.procs)} processors, "
             f"resampler queries={self.config.num_queries}"
+        )
+
+    @staticmethod
+    def _infer_config_from_checkpoint(state_dict: Dict[str, Any]) -> IPAdapterConfig:
+        """
+        Infer architecture parameters directly from checkpoint tensors.
+
+        This enables compatibility with multiple WAN IPAdapter variants
+        (e.g. SigLIP2-based and ViT-H/Plus-style checkpoints) without
+        requiring hard-coded per-model config tables.
+        """
+        image_proj = state_dict["image_proj"]
+        ip_adapter = state_dict["ip_adapter"]
+
+        # Resampler core dimensions
+        latents = image_proj["latents"]
+        resampler_dim = latents.shape[-1]
+        num_queries = latents.shape[1]
+        embedding_dim = image_proj["proj_in.weight"].shape[1]
+        output_dim = image_proj["proj_out.weight"].shape[0]
+
+        # Depth from transformer layers
+        layer_indices = {
+            int(key.split(".")[1])
+            for key in image_proj.keys()
+            if key.startswith("layers.")
+        }
+        resampler_depth = (max(layer_indices) + 1) if layer_indices else 0
+
+        # FF multiplier from first layer feed-forward matrix
+        ff_inner = image_proj["layers.0.1.1.weight"].shape[0]
+        ff_mult = max(1, ff_inner // resampler_dim)
+
+        # Attention head dimensions from IP processor weights
+        first_proc_prefix = min(int(k.split(".")[0]) for k in ip_adapter.keys())
+        first_proc = str(first_proc_prefix)
+        hidden_size = ip_adapter[f"{first_proc}.to_k_ip.weight"].shape[0]
+        timesteps_emb_dim = ip_adapter[f"{first_proc}.norm_ip.linear.weight"].shape[1]
+        head_dim = ip_adapter[f"{first_proc}.norm_q.weight"].shape[0]
+        resampler_heads = max(1, hidden_size // head_dim)
+        resampler_dim_head = max(1, resampler_dim // resampler_heads)
+
+        # Best-effort encoder type label from embedding width
+        if embedding_dim == 1024:
+            encoder_type = VisionEncoderType.CLIP_VIT_H
+        else:
+            encoder_type = VisionEncoderType.SIGLIP2_SO400M
+
+        return IPAdapterConfig(
+            resampler_dim=resampler_dim,
+            resampler_depth=resampler_depth,
+            resampler_dim_head=resampler_dim_head,
+            resampler_heads=resampler_heads,
+            num_queries=num_queries,
+            output_dim=output_dim,
+            ff_mult=ff_mult,
+            hidden_size=hidden_size,
+            cross_attention_dim=hidden_size,
+            head_dim=head_dim,
+            timesteps_emb_dim=timesteps_emb_dim,
+            vision_encoder=encoder_type,
+            embedding_dim_override=embedding_dim,
         )
     
     def _build_resampler(self) -> TimeResampler:
@@ -540,7 +636,7 @@ class IPAdapterWANLoader:
         provider: str,
     ) -> Tuple[WANIPAdapter]:
         """
-        Load IPAdapter model with SigLIP2 so400m configuration.
+        Load IPAdapter model and auto-detect checkpoint architecture.
         
         Args:
             ipadapter: Checkpoint filename
@@ -549,11 +645,11 @@ class IPAdapterWANLoader:
         Returns:
             Tuple containing loaded WANIPAdapter instance
         """
-        logger.info(f"Loading InstantX IPAdapter WAN model: {ipadapter} (SigLIP2 so400m)")
-        
-        # Always use SigLIP2 so400m encoder
-        config = IPAdapterConfig(vision_encoder=VisionEncoderType.SIGLIP2_SO400M)
-        model = WANIPAdapter(ipadapter, provider, config=config)
+        logger.info(
+            "Loading InstantX IPAdapter WAN model: %s (auto-detect architecture)",
+            ipadapter,
+        )
+        model = WANIPAdapter(ipadapter, provider, config=None)
         
         return (model,)
 
@@ -563,7 +659,9 @@ class ApplyIPAdapterWAN:
     ComfyUI node for applying IPAdapter conditioning to diffusion models.
     
     Supports timestep-based scheduling for fine-grained control over
-    when IP conditioning is active during the denoising process.
+    when IP conditioning is active during the denoising process, with
+    runtime validation that vision embedding dimensions match the loaded
+    IPAdapter checkpoint.
     """
     
     @classmethod
@@ -626,13 +724,15 @@ class ApplyIPAdapterWAN:
         # Extract embeddings (penultimate layer for richer features)
         image_embed_tensor = image_embed.penultimate_hidden_states
         
-        # Verify we're using SigLIP2 (node only supports SigLIP2)
-        seq_len = image_embed_tensor.shape[1]
-        if seq_len == 257:
-            logger.warning(
-                f"Embeddings have fixed seq_len=257 (CLIP ViT-H characteristic). "
-                f"This node requires SigLIP2 so400m naflex with variable sequence length. "
-                f"Please use a SigLIP2 vision encoder model."
+        # Validate vision embedding compatibility with loaded checkpoint.
+        embed_dim = image_embed_tensor.shape[-1]
+        expected_embed_dim = ipadapter.config.embedding_dim
+        if embed_dim != expected_embed_dim:
+            raise ValueError(
+                f"{NODE_APPLY_NAME}: image_embed dim mismatch. "
+                f"Loaded IPAdapter expects embed_dim={expected_embed_dim}, "
+                f"but received embed_dim={embed_dim}. "
+                f"Please use a matching CLIP vision encoder/checkpoint pair."
             )
         
         # Prepare CFG-compatible embeddings: [conditional, unconditional]
@@ -646,7 +746,7 @@ class ApplyIPAdapterWAN:
         print(
             f"[{NODE_APPLY_NAME}] setup device={ipadapter.device} dtype={ipadapter.dtype} "
             f"weight={weight:.3f} range=[{start_percent:.3f},{end_percent:.3f}] "
-            f"embed_shape={tuple(image_embed_tensor.shape)}"
+            f"embed_shape={tuple(image_embed_tensor.shape)} expected_embed_dim={expected_embed_dim}"
         )
         patch_model(
             new_model,
