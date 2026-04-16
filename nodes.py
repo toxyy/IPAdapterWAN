@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from enum import Enum, auto
 import math
 import itertools
+import types
 
 import torch
 import torch.nn as nn
@@ -544,12 +545,91 @@ def patch_model(
         for line in attention_candidates:
             emit_debug(line)
 
+        # WAN fallback: direct monkey-patch of WanSelfAttention modules.
+        # This path is used when Comfy patch_replace cannot find JointBlock hooks.
+        wan_self_attn_modules: List[Tuple[str, nn.Module]] = [
+            (n, m)
+            for n, m in model.named_modules()
+            if type(m).__name__ == "WanSelfAttention" and hasattr(m, "q") and hasattr(m, "k")
+        ]
+        if wan_self_attn_modules:
+            emit_debug(
+                f"fallback: found {len(wan_self_attn_modules)} WanSelfAttention modules; "
+                "installing direct forward wrappers"
+            )
+            for idx, (module_name, attn_module) in enumerate(wan_self_attn_modules):
+                if getattr(attn_module, "_ipadapter_wan_patched", False):
+                    continue
+
+                original_forward = attn_module.forward
+                adapter = ip_procs[idx % len(ip_procs)]
+
+                def patched_forward(self_attn, *f_args, __orig=original_forward, __adapter=adapter, **f_kwargs):
+                    out = __orig(*f_args, **f_kwargs)
+                    ip_hidden = ip_options_dict.get("hidden_states")
+                    t_emb = ip_options_dict.get("t_emb")
+                    if ip_hidden is None or t_emb is None:
+                        return out
+
+                    if not f_args:
+                        return out
+                    hidden_states = f_args[0]
+                    if not torch.is_tensor(hidden_states) or not torch.is_tensor(out):
+                        return out
+                    if hidden_states.ndim != 3 or out.ndim != 3:
+                        return out
+
+                    # q/k/v projections expected on WAN attention modules.
+                    if not (hasattr(self_attn, "q") and hasattr(self_attn, "k") and hasattr(self_attn, "v")):
+                        return out
+                    try:
+                        img_query = self_attn.q(hidden_states)
+                        img_key = self_attn.k(hidden_states)
+                        img_value = self_attn.v(hidden_states)
+                    except Exception:
+                        return out
+
+                    if img_query.ndim != 3 or img_key.ndim != 3 or img_value.ndim != 3:
+                        return out
+
+                    n_heads = getattr(self_attn, "num_heads", None) or getattr(self_attn, "heads", None)
+                    if n_heads is None:
+                        # Derive head count from projection width and adapter head dim.
+                        head_dim = max(1, __adapter.norm_q.weight.shape[0])
+                        n_heads = max(1, img_query.shape[-1] // head_dim)
+
+                    head_dim_val = max(1, img_value.shape[-1] // n_heads)
+                    img_value = img_value.view(img_value.shape[0], img_value.shape[1], n_heads, head_dim_val)
+
+                    ip_delta = __adapter(
+                        ip_hidden,
+                        img_query,
+                        img_key,
+                        img_value,
+                        t_emb,
+                        int(n_heads),
+                    )
+                    if ip_delta is None or ip_delta.shape != out.shape:
+                        return out
+
+                    return out + ip_delta.to(out.dtype) * float(ip_options_dict.get("weight", 1.0))
+
+                attn_module.forward = types.MethodType(patched_forward, attn_module)
+                attn_module._ipadapter_wan_patched = True
+                proc_idx += 1
+                if proc_idx <= 60:
+                    emit_debug(
+                        f"fallback patched WanSelfAttention idx={proc_idx} "
+                        f"name='{module_name}' class='{type(attn_module).__name__}' module_id={id(attn_module)}"
+                    )
+
         for line in debug_lines:
             emit_debug(line)
-        emit_debug(
-            "warning: no attention blocks were patched. This may indicate an incompatible "
-            "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing JointBlock modules)."
-        )
+        if proc_idx == 0:
+            emit_debug(
+                "warning: no attention blocks were patched. This may indicate an incompatible "
+                "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing JointBlock modules)."
+            )
 
 
 # =============================================================================
