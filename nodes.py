@@ -242,12 +242,30 @@ def patch_model(
         start: Start percentage for timestep scheduling
         end: End percentage for timestep scheduling
     """
-    def _unwrap_module(module: Any) -> Any:
-        """Unwrap common wrapper attributes (DisTorch2/Distributed/quant wrappers)."""
+    def _module_stats(module: nn.Module) -> Dict[str, int]:
+        jointblock_like = 0
+        to_qk_like = 0
+        total = 0
+        for _, mod in module.named_modules():
+            total += 1
+            if hasattr(mod, "context_block") and hasattr(mod, "x_block"):
+                jointblock_like += 1
+            if hasattr(mod, "to_q") and hasattr(mod, "to_k"):
+                to_qk_like += 1
+        return {
+            "total": total,
+            "jointblock_like": jointblock_like,
+            "to_qk_like": to_qk_like,
+        }
+
+    def _resolve_best_module(module: Any) -> Any:
+        """Resolve best patching target across wrapper chain (DisTorch2/Distributed/GGUF)."""
+        chain: List[Tuple[str, nn.Module]] = []
         seen_ids = set()
         current = module
-        while current is not None and id(current) not in seen_ids:
+        while isinstance(current, nn.Module) and id(current) not in seen_ids:
             seen_ids.add(id(current))
+            chain.append((type(current).__name__, current))
             next_module = None
             for attr in ("module", "model", "inner_model", "unet", "wrapped_module"):
                 candidate = getattr(current, attr, None)
@@ -257,7 +275,17 @@ def patch_model(
             if next_module is None:
                 break
             current = next_module
-        return current
+
+        # Prefer module level with the most JointBlock-like modules.
+        best_idx = 0
+        best_score: Tuple[int, int, int] = (-1, -1, -1)
+        for idx, (_, mod) in enumerate(chain):
+            stats = _module_stats(mod)
+            score = (stats["jointblock_like"], stats["to_qk_like"], stats["total"])
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return chain[best_idx][1] if chain else module
 
     # Resolve diffusion model robustly across different loaders/wrappers.
     base_model = getattr(patcher, "model", None)
@@ -269,7 +297,7 @@ def patch_model(
             f"{NODE_APPLY_NAME}: could not resolve diffusion_model from patcher "
             f"(patcher_type={type(patcher).__name__}, base_model_type={type(base_model).__name__})."
         )
-    model = _unwrap_module(diffusion_model)
+    model = _resolve_best_module(diffusion_model)
 
     # Resolve timestep schedule robustly; some wrappers do not expose model_config directly.
     sampling_settings = getattr(getattr(base_model, "model_config", None), "sampling_settings", None)
@@ -405,9 +433,17 @@ def patch_model(
             proc_idx += 1
     
     logger.debug(f"Patched {proc_idx} attention blocks with IP adapters")
+    model_stats = _module_stats(model) if isinstance(model, nn.Module) else {
+        "total": 0,
+        "jointblock_like": 0,
+        "to_qk_like": 0,
+    }
     emit_debug(
         (
             f"resolved_diffusion_model={type(model).__name__} "
+            f"module_stats(total={model_stats['total']}, "
+            f"jointblock_like={model_stats['jointblock_like']}, "
+            f"to_qk_like={model_stats['to_qk_like']}) "
             f"patched attention blocks={proc_idx}"
             f" timestep_max={timestep_schedule_max}"
             f" weight={weight:.3f}"
@@ -415,6 +451,23 @@ def patch_model(
         )
     )
     if proc_idx == 0:
+        # Extra diagnostics for incompatible wrappers/topologies.
+        debug_lines: List[str] = []
+        for module_name, module_obj in model.named_modules():
+            cls_name = type(module_obj).__name__
+            if "block" in module_name.lower() or "joint" in cls_name.lower():
+                attrs = []
+                for attr in ("context_block", "x_block", "to_q", "to_k", "attn", "attn2"):
+                    if hasattr(module_obj, attr):
+                        attrs.append(attr)
+                if attrs:
+                    debug_lines.append(
+                        f"candidate module='{module_name}' class='{cls_name}' attrs={attrs}"
+                    )
+            if len(debug_lines) >= 50:
+                break
+        for line in debug_lines:
+            emit_debug(line)
         emit_debug(
             "warning: no attention blocks were patched. This may indicate an incompatible "
             "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing JointBlock modules)."
