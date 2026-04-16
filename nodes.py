@@ -241,10 +241,43 @@ def patch_model(
         start: Start percentage for timestep scheduling
         end: End percentage for timestep scheduling
     """
-    model = patcher.model.diffusion_model
-    timestep_schedule_max = patcher.model.model_config.sampling_settings.get(
-        "timesteps", 1000
-    )
+    def _unwrap_module(module: Any) -> Any:
+        """Unwrap common wrapper attributes (DisTorch2/Distributed/quant wrappers)."""
+        seen_ids = set()
+        current = module
+        while current is not None and id(current) not in seen_ids:
+            seen_ids.add(id(current))
+            next_module = None
+            for attr in ("module", "model", "inner_model", "unet", "wrapped_module"):
+                candidate = getattr(current, attr, None)
+                if isinstance(candidate, nn.Module):
+                    next_module = candidate
+                    break
+            if next_module is None:
+                break
+            current = next_module
+        return current
+
+    # Resolve diffusion model robustly across different loaders/wrappers.
+    base_model = getattr(patcher, "model", None)
+    diffusion_model = getattr(base_model, "diffusion_model", None)
+    if diffusion_model is None and hasattr(base_model, "model"):
+        diffusion_model = getattr(base_model.model, "diffusion_model", None)
+    if diffusion_model is None:
+        raise RuntimeError(
+            f"{NODE_APPLY_NAME}: could not resolve diffusion_model from patcher "
+            f"(patcher_type={type(patcher).__name__}, base_model_type={type(base_model).__name__})."
+        )
+    model = _unwrap_module(diffusion_model)
+
+    # Resolve timestep schedule robustly; some wrappers do not expose model_config directly.
+    sampling_settings = getattr(getattr(base_model, "model_config", None), "sampling_settings", None)
+    if sampling_settings is None and hasattr(base_model, "model"):
+        sampling_settings = getattr(getattr(base_model.model, "model_config", None), "sampling_settings", None)
+    timestep_schedule_max = 1000
+    if isinstance(sampling_settings, dict):
+        timestep_schedule_max = int(sampling_settings.get("timesteps", 1000))
+    timestep_schedule_max = max(1, timestep_schedule_max)
     
     # Create scheduler predicate
     is_active = create_timestep_scheduler(start, end)
@@ -372,12 +405,18 @@ def patch_model(
     logger.debug(f"Patched {proc_idx} attention blocks with IP adapters")
     emit_debug(
         (
+            f"resolved_diffusion_model={type(model).__name__} "
             f"patched attention blocks={proc_idx}"
             f" timestep_max={timestep_schedule_max}"
             f" weight={weight:.3f}"
             f" range=[{start:.3f},{end:.3f}]"
         )
     )
+    if proc_idx == 0:
+        emit_debug(
+            "warning: no attention blocks were patched. This may indicate an incompatible "
+            "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing to_q/to_k modules)."
+        )
 
 
 # =============================================================================
