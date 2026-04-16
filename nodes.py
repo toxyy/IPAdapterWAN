@@ -24,6 +24,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from enum import Enum, auto
+import math
 
 import torch
 import torch.nn as nn
@@ -562,8 +563,27 @@ class WANIPAdapter:
         hidden_size = ip_adapter[f"{first_proc}.to_k_ip.weight"].shape[0]
         timesteps_emb_dim = ip_adapter[f"{first_proc}.norm_ip.linear.weight"].shape[1]
         head_dim = ip_adapter[f"{first_proc}.norm_q.weight"].shape[0]
-        resampler_heads = max(1, hidden_size // head_dim)
-        resampler_dim_head = max(1, resampler_dim // resampler_heads)
+        # Infer Perceiver attention inner dimensions from resampler weights, not UNet hidden size.
+        # to_q: (inner_dim, resampler_dim), to_kv: (2 * inner_dim, resampler_dim)
+        attn_inner_dim = image_proj["layers.0.0.to_q.weight"].shape[0]
+        if image_proj.get("layers.0.0.to_kv.weight", None) is not None:
+            kv_inner_dim = image_proj["layers.0.0.to_kv.weight"].shape[0] // 2
+            if kv_inner_dim != attn_inner_dim:
+                logger.warning(
+                    "Checkpoint attention inner-dim mismatch (to_q=%s vs to_kv=%s). "
+                    "Using to_q-derived value.",
+                    attn_inner_dim,
+                    kv_inner_dim,
+                )
+
+        if attn_inner_dim % head_dim == 0:
+            resampler_dim_head = head_dim
+            resampler_heads = max(1, attn_inner_dim // head_dim)
+        else:
+            # Fallback for unusual checkpoints: choose a valid factorization of inner_dim.
+            inferred_dim_head = math.gcd(attn_inner_dim, resampler_dim)
+            resampler_dim_head = max(1, inferred_dim_head)
+            resampler_heads = max(1, attn_inner_dim // resampler_dim_head)
 
         # Best-effort encoder type label from embedding width
         if embedding_dim == 1024:
