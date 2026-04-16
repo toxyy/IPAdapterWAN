@@ -48,6 +48,7 @@ folder_paths.folder_names_and_paths["ipadapter"] = (
 )
 
 logger = logging.getLogger(__name__)
+NODE_APPLY_NAME = "Apply IPAdapter WAN Model"
 
 
 class VisionEncoderType(Enum):
@@ -248,6 +249,17 @@ def patch_model(
         "weight": weight,
     }
     
+    def emit_debug(message: str) -> None:
+        # Console visibility is important for ComfyUI users diagnosing workflows.
+        print(f"[{NODE_APPLY_NAME}] {message}")
+        logger.info("[%s] %s", NODE_APPLY_NAME, message)
+
+    debug_state = {
+        "last_active": None,
+        "last_bucket": None,
+        "step": 0,
+    }
+
     def ddit_wrapper(
         forward: Callable,
         args: Dict[str, Any],
@@ -269,6 +281,7 @@ def patch_model(
         raw_timestep = args["timestep"].flatten()[0].detach().float().cpu().item()
         t_percent = 1.0 - (raw_timestep / float(timestep_schedule_max))
         t_percent = max(0.0, min(1.0, t_percent))
+        debug_state["step"] += 1
         
         if is_active(t_percent):
             # Compute batch size accounting for classifier-free guidance
@@ -298,24 +311,36 @@ def patch_model(
             
             ip_options_dict["hidden_states"] = image_emb
             ip_options_dict["t_emb"] = t_emb
-            if logger.isEnabledFor(logging.DEBUG):
-                ip_norm = image_emb.float().norm(dim=-1).mean().item()
-                logger.debug(
-                    "IPAdapter active: t_percent=%.4f weight=%.3f mean_ip_norm=%.6f",
-                    t_percent,
-                    ip_options_dict["weight"],
-                    ip_norm,
+            ip_norm = image_emb.float().norm(dim=-1).mean().item()
+            # Emit on active-state entry and at coarse 5% progression buckets.
+            progress_bucket = int(t_percent * 20)
+            if debug_state["last_active"] is not True or debug_state["last_bucket"] != progress_bucket:
+                emit_debug(
+                    (
+                        "active"
+                        f" step={debug_state['step']}"
+                        f" t_percent={t_percent:.4f}"
+                        f" range=[{start:.3f},{end:.3f}]"
+                        f" weight={ip_options_dict['weight']:.3f}"
+                        f" mean_ip_norm={ip_norm:.6f}"
+                    )
                 )
+            debug_state["last_active"] = True
+            debug_state["last_bucket"] = progress_bucket
         else:
             ip_options_dict["hidden_states"] = None
             ip_options_dict["t_emb"] = None
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "IPAdapter inactive: t_percent=%.4f outside [%.3f, %.3f]",
-                    t_percent,
-                    start,
-                    end,
+            if debug_state["last_active"] is not False:
+                emit_debug(
+                    (
+                        "inactive"
+                        f" step={debug_state['step']}"
+                        f" t_percent={t_percent:.4f}"
+                        f" outside range=[{start:.3f},{end:.3f}]"
+                    )
                 )
+            debug_state["last_active"] = False
+            debug_state["last_bucket"] = None
         
         return forward(args["input"], args["timestep"], **args["c"])
     
@@ -336,6 +361,14 @@ def patch_model(
             proc_idx += 1
     
     logger.debug(f"Patched {proc_idx} attention blocks with IP adapters")
+    emit_debug(
+        (
+            f"patched attention blocks={proc_idx}"
+            f" timestep_max={timestep_schedule_max}"
+            f" weight={weight:.3f}"
+            f" range=[{start:.3f},{end:.3f}]"
+        )
+    )
 
 
 # =============================================================================
@@ -610,6 +643,11 @@ class ApplyIPAdapterWAN:
         ).to(ipadapter.device, dtype=ipadapter.dtype)
         
         # Apply patching
+        print(
+            f"[{NODE_APPLY_NAME}] setup device={ipadapter.device} dtype={ipadapter.dtype} "
+            f"weight={weight:.3f} range=[{start_percent:.3f},{end_percent:.3f}] "
+            f"embed_shape={tuple(image_embed_tensor.shape)}"
+        )
         patch_model(
             new_model,
             ipadapter.procs,
