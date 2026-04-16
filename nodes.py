@@ -393,8 +393,9 @@ def patch_model(
     # Strategy: Round-robin assignment of processors to blocks
     proc_idx = 0
     for name, module in model.named_modules():
-        # Identify attention blocks by their characteristic projections
-        if hasattr(module, "to_q") and hasattr(module, "to_k"):
+        # WAN uses MMDiT JointBlocks. Patch only modules compatible with JointBlockIPWrapper.
+        is_jointblock_like = hasattr(module, "context_block") and hasattr(module, "x_block")
+        if is_jointblock_like:
             wrapper = JointBlockIPWrapper(
                 module,
                 ip_procs[proc_idx % len(ip_procs)],
@@ -416,7 +417,7 @@ def patch_model(
     if proc_idx == 0:
         emit_debug(
             "warning: no attention blocks were patched. This may indicate an incompatible "
-            "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing to_q/to_k modules)."
+            "loader/wrapper topology (e.g., distributed/quantized wrapper not exposing JointBlock modules)."
         )
 
 
