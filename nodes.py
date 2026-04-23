@@ -379,7 +379,13 @@ def patch_model(
         """
         # Compute timestep percentage (1 - t/max gives progress through denoising)
         raw_timestep = args["timestep"].flatten()[0].detach().float().cpu().item()
-        t_percent = 1.0 - (raw_timestep / float(timestep_schedule_max))
+        # Comfy can pass either:
+        # - sigma-space timesteps (FLOW/WAN) typically in [0, 1]
+        # - integer-like schedule timesteps in [0, timestep_schedule_max]
+        if 0.0 <= raw_timestep <= 1.5:
+            t_percent = 1.0 - raw_timestep
+        else:
+            t_percent = 1.0 - (raw_timestep / float(timestep_schedule_max))
         t_percent = max(0.0, min(1.0, t_percent))
         debug_state["step"] += 1
         
@@ -558,10 +564,9 @@ def patch_model(
                 "installing direct forward wrappers"
             )
             for idx, (module_name, attn_module) in enumerate(wan_self_attn_modules):
-                if getattr(attn_module, "_ipadapter_wan_patched", False):
-                    continue
-
-                original_forward = attn_module.forward
+                if not getattr(attn_module, "_ipadapter_wan_patched", False):
+                    attn_module._ipadapter_wan_original_forward = attn_module.forward
+                original_forward = attn_module._ipadapter_wan_original_forward
                 adapter = ip_procs[idx % len(ip_procs)]
 
                 def patched_forward(self_attn, *f_args, __orig=original_forward, __adapter=adapter, **f_kwargs):
@@ -592,11 +597,26 @@ def patch_model(
                     if img_query.ndim != 3 or img_key.ndim != 3 or img_value.ndim != 3:
                         return out
 
-                    n_heads = getattr(self_attn, "num_heads", None) or getattr(self_attn, "heads", None)
-                    if n_heads is None:
-                        # Derive head count from projection width and adapter head dim.
-                        head_dim = max(1, __adapter.norm_q.weight.shape[0])
-                        n_heads = max(1, img_query.shape[-1] // head_dim)
+                    # Align q/k/v width with adapter hidden size (e.g. WAN self-attn may use 2560 while
+                    # IPAdapter uses 2432). We pad/truncate on the feature axis for compatibility.
+                    target_dim = int(__adapter.to_k_ip.weight.shape[0])
+                    def _align_last_dim(t: torch.Tensor, dim: int) -> torch.Tensor:
+                        current = t.shape[-1]
+                        if current == dim:
+                            return t
+                        if current > dim:
+                            return t[..., :dim]
+                        pad = dim - current
+                        return torch.nn.functional.pad(t, (0, pad))
+
+                    img_query = _align_last_dim(img_query, target_dim)
+                    img_key = _align_last_dim(img_key, target_dim)
+                    img_value = _align_last_dim(img_value, target_dim)
+
+                    head_dim = max(1, int(__adapter.norm_q.weight.shape[0]))
+                    if target_dim % head_dim != 0:
+                        return out
+                    n_heads = max(1, target_dim // head_dim)
 
                     head_dim_val = max(1, img_value.shape[-1] // n_heads)
                     img_value = img_value.view(img_value.shape[0], img_value.shape[1], n_heads, head_dim_val)
