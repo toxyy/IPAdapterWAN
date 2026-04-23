@@ -27,6 +27,7 @@ from enum import Enum, auto
 import math
 import itertools
 import types
+import pickle
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,11 @@ import folder_paths
 
 from .models.resampler import TimeResampler
 from .models.jointblock import JointBlockIPWrapper, IPAttnProcessor
+
+try:
+    from safetensors.torch import load_file as safetensors_load_file
+except Exception:
+    safetensors_load_file = None
 
 
 # =============================================================================
@@ -378,14 +384,20 @@ def patch_model(
         the entire call stack.
         """
         # Compute timestep percentage (1 - t/max gives progress through denoising)
-        raw_timestep = args["timestep"].flatten()[0].detach().float().cpu().item()
-        # Comfy can pass either:
-        # - sigma-space timesteps (FLOW/WAN) typically in [0, 1]
-        # - integer-like schedule timesteps in [0, timestep_schedule_max]
-        if 0.0 <= raw_timestep <= 1.5:
-            t_percent = 1.0 - raw_timestep
+        timestep_tensor = args["timestep"].detach().float()
+        raw_timestep = timestep_tensor.flatten()[0].cpu().item()
+        max_abs_timestep = timestep_tensor.abs().max().cpu().item()
+        sigma_like_timesteps = max_abs_timestep <= 1.5
+
+        # Normalize once and reuse for both scheduling and resampler units.
+        if sigma_like_timesteps:
+            timestep_normalized = raw_timestep
+            timestep_for_resampler = args["timestep"] * timestep_schedule_max
         else:
-            t_percent = 1.0 - (raw_timestep / float(timestep_schedule_max))
+            timestep_normalized = raw_timestep / float(timestep_schedule_max)
+            timestep_for_resampler = args["timestep"]
+
+        t_percent = 1.0 - timestep_normalized
         t_percent = max(0.0, min(1.0, t_percent))
         debug_state["step"] += 1
         
@@ -401,11 +413,8 @@ def patch_model(
             embeds = clip_embeds[cond_or_uncond]
             embeds = torch.repeat_interleave(embeds, batch_size, dim=0)
             
-            # Scale timestep to model's expected range
-            timestep = args["timestep"] * timestep_schedule_max
-            
             # Compute IP embeddings with timestep conditioning
-            image_emb, t_emb = resampler(embeds, timestep, need_temb=True)
+            image_emb, t_emb = resampler(embeds, timestep_for_resampler, need_temb=True)
 
             # Prevent unconditional branch leakage:
             # the resampler can produce non-zero outputs from zero embeds due to biases.
@@ -440,6 +449,7 @@ def patch_model(
                         f" std={ip_std:.6f}"
                         f" uncond_ratio={uncond_ratio:.3f}"
                         f" cond_or_uncond={list(map(int, cond_or_uncond.cpu().tolist()))}"
+                        f" sigma_like={sigma_like_timesteps}"
                         f" input_shape={tuple(args['input'].shape)}"
                     )
                 )
@@ -686,6 +696,45 @@ def patch_model(
 # Model Container
 # =============================================================================
 
+def _load_ipadapter_checkpoint(
+    checkpoint_path: str,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """
+    Load IPAdapter checkpoint with safe defaults and format-aware fallbacks.
+
+    Priority:
+    1) `.safetensors` -> safetensors loader (no pickle execution)
+    2) torch.load(weights_only=True)
+    3) optional fallback torch.load(weights_only=False) for trusted files
+    """
+    ext = os.path.splitext(checkpoint_path)[1].lower()
+    if ext == ".safetensors":
+        if safetensors_load_file is None:
+            raise RuntimeError(
+                "safetensors checkpoint detected but safetensors is unavailable in this environment."
+            )
+        return safetensors_load_file(checkpoint_path, device=str(device))
+
+    try:
+        return torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=True,
+        )
+    except pickle.UnpicklingError as exc:
+        logger.warning(
+            "weights_only=True load failed for %s (%s). Retrying with weights_only=False. "
+            "Use only with trusted files.",
+            checkpoint_path,
+            exc,
+        )
+        return torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+
 class WANIPAdapter:
     """
     Container for IPAdapter WAN model components.
@@ -728,11 +777,18 @@ class WANIPAdapter:
         checkpoint_path = os.path.join(MODELS_DIR, checkpoint)
         logger.info(f"Loading IPAdapter checkpoint from {checkpoint_path}")
         
-        self.state_dict = torch.load(
-            checkpoint_path,
-            map_location=self.device,
-            weights_only=True,
-        )
+        self.state_dict = _load_ipadapter_checkpoint(checkpoint_path, self.device)
+        if not isinstance(self.state_dict, dict):
+            raise RuntimeError(
+                f"Unsupported checkpoint format for {checkpoint}. Expected dict-like state_dict."
+            )
+        if "image_proj" not in self.state_dict or "ip_adapter" not in self.state_dict:
+            available_keys = list(self.state_dict.keys())[:20]
+            raise RuntimeError(
+                "Checkpoint is not WAN IPAdapter-compatible. "
+                "Expected keys 'image_proj' and 'ip_adapter'. "
+                f"Found keys (sample): {available_keys}"
+            )
 
         # Auto-infer architecture from checkpoint when explicit config isn't provided.
         if config is None:
