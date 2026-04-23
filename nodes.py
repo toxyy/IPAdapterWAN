@@ -613,7 +613,7 @@ def patch_model(
                     img_key = _align_last_dim(img_key, target_dim)
                     img_value = _align_last_dim(img_value, target_dim)
 
-                    head_dim = max(1, int(__adapter.norm_q.weight.shape[0]))
+                    head_dim = max(1, int(getattr(__adapter, "head_dim", 64)))
                     if target_dim % head_dim != 0:
                         return out
                     n_heads = max(1, target_dim // head_dim)

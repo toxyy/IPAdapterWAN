@@ -149,6 +149,7 @@ class IPAttnProcessor(nn.Module):
             time_embedding_dim=timesteps_emb_dim,
             mode="normal",
         )
+        self.head_dim = head_dim
         
         # IP-specific key-value projections
         self.to_k_ip = nn.Linear(ip_hidden_states_dim, hidden_size, bias=False)
