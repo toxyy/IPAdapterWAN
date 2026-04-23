@@ -629,9 +629,39 @@ def patch_model(
                         t_emb,
                         int(n_heads),
                     )
-                    if ip_delta is None or ip_delta.shape != out.shape:
+                    if ip_delta is None:
                         return out
 
+                    # Align output space for WAN attention variants where attention out-width
+                    # differs from module forward output width.
+                    if ip_delta.shape != out.shape and ip_delta.ndim == 3 and out.ndim == 3:
+                        if hasattr(self_attn, "o"):
+                            try:
+                                projected = self_attn.o(ip_delta)
+                                if torch.is_tensor(projected):
+                                    ip_delta = projected
+                            except Exception:
+                                pass
+                        if ip_delta.shape != out.shape and ip_delta.shape[0] == out.shape[0] and ip_delta.shape[1] == out.shape[1]:
+                            target_dim = out.shape[-1]
+                            if ip_delta.shape[-1] > target_dim:
+                                ip_delta = ip_delta[..., :target_dim]
+                            else:
+                                ip_delta = torch.nn.functional.pad(ip_delta, (0, target_dim - ip_delta.shape[-1]))
+
+                    if ip_delta.shape != out.shape:
+                        if debug_state["step"] <= 3:
+                            emit_debug(
+                                f"fallback skip shape_mismatch module='{type(self_attn).__name__}' "
+                                f"ip_delta_shape={tuple(ip_delta.shape)} out_shape={tuple(out.shape)}"
+                            )
+                        return out
+
+                    if debug_state["step"] <= 3:
+                        emit_debug(
+                            f"fallback apply module='{type(self_attn).__name__}' "
+                            f"delta_norm={ip_delta.float().norm().item():.6f} out_norm={out.float().norm().item():.6f}"
+                        )
                     return out + ip_delta.to(out.dtype) * float(ip_options_dict.get("weight", 1.0))
 
                 attn_module.forward = types.MethodType(patched_forward, attn_module)
