@@ -735,6 +735,48 @@ def _load_ipadapter_checkpoint(
             weights_only=False,
         )
 
+
+def _normalize_ipadapter_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize checkpoint layouts to:
+      {
+        "image_proj": {...},
+        "ip_adapter": {...},
+      }
+
+    Supported raw layouts:
+    - nested dict (already normalized)
+    - flat safetensors-style keys: "image_proj.*", "ip_adapter.*"
+    - wrapped: {"state_dict": {...}}
+    """
+    if "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+
+    # Already normalized
+    if (
+        "image_proj" in state_dict
+        and "ip_adapter" in state_dict
+        and isinstance(state_dict["image_proj"], dict)
+        and isinstance(state_dict["ip_adapter"], dict)
+    ):
+        return state_dict
+
+    image_proj: Dict[str, Any] = {}
+    ip_adapter: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if key.startswith("image_proj."):
+            image_proj[key[len("image_proj."):]] = value
+        elif key.startswith("ip_adapter."):
+            ip_adapter[key[len("ip_adapter."):]] = value
+
+    if image_proj and ip_adapter:
+        return {
+            "image_proj": image_proj,
+            "ip_adapter": ip_adapter,
+        }
+
+    return state_dict
+
 class WANIPAdapter:
     """
     Container for IPAdapter WAN model components.
@@ -777,7 +819,8 @@ class WANIPAdapter:
         checkpoint_path = os.path.join(MODELS_DIR, checkpoint)
         logger.info(f"Loading IPAdapter checkpoint from {checkpoint_path}")
         
-        self.state_dict = _load_ipadapter_checkpoint(checkpoint_path, self.device)
+        raw_state_dict = _load_ipadapter_checkpoint(checkpoint_path, self.device)
+        self.state_dict = _normalize_ipadapter_state_dict(raw_state_dict)
         if not isinstance(self.state_dict, dict):
             raise RuntimeError(
                 f"Unsupported checkpoint format for {checkpoint}. Expected dict-like state_dict."
@@ -785,10 +828,15 @@ class WANIPAdapter:
         if "image_proj" not in self.state_dict or "ip_adapter" not in self.state_dict:
             available_keys = list(self.state_dict.keys())[:20]
             raise RuntimeError(
-                "Checkpoint is not WAN IPAdapter-compatible. "
-                "Expected keys 'image_proj' and 'ip_adapter'. "
+                "Checkpoint is not WAN-compatible for this node. "
+                "Expected WAN-style keys 'image_proj' and 'ip_adapter' (nested or flat-prefixed). "
                 f"Found keys (sample): {available_keys}"
             )
+        logger.info(
+            "Checkpoint key layout normalized: image_proj_keys=%s ip_adapter_keys=%s",
+            len(self.state_dict["image_proj"]),
+            len(self.state_dict["ip_adapter"]),
+        )
 
         # Auto-infer architecture from checkpoint when explicit config isn't provided.
         if config is None:
